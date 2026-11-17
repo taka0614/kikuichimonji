@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>刀掛け AR — 菊花鍔マーカー</title>
+<title>菊一文字 AR — 日本刀</title>
 <style>
   html,body{margin:0;height:100%;background:#0e0e0f;color:#eee;font-family:"Hiragino Sans","Yu Gothic","Noto Sans JP",sans-serif;overflow:hidden;-webkit-tap-highlight-color:transparent}
   #stage{position:fixed;inset:0}
@@ -37,7 +37,7 @@
 <div id="status"></div>
 
 <div id="start">
-  <h1>刀掛け AR</h1>
+  <h1>菊一文字 AR</h1>
   <img src="marker.jpg" alt="マーカー（菊花透かし鍔）">
   <p>この菊花鍔の画像をマーカーにして、刀掛けに掛かった刀を表示します。<br>「抜刀」で鞘が外れ、刃文と樋の入った刀身が見られます。</p>
   <div class="btns">
@@ -50,6 +50,7 @@
 
 <div id="ui">
   <button id="btnDraw" class="primary">抜刀</button>
+  <button id="btnMode" style="display:none">表示：正面</button>
   <button id="btnRot">回転</button>
   <button id="btnSmall">小</button>
   <button id="btnBig">大</button>
@@ -524,8 +525,28 @@ async function startAR() {
     const { renderer, scene, camera } = mindar;
     const m = makeRig(scene, renderer, $('stage'));
     const anchor = mindar.addAnchor(0);
-    const holder = new THREE.Group(); holder.scale.setScalar(1.6); holder.add(m.root); m.root.position.x = 0.06;
-    anchor.group.add(holder);
+    // orient: マーカーに対する向き / holder: 回転・拡大の操作用 / m.root: モデル（Z上・正面は-Y）
+    const orient = new THREE.Group(), holder = new THREE.Group();
+    orient.add(holder); holder.add(m.root); anchor.group.add(orient);
+    holder.scale.setScalar(1.25);
+    let viewMode = 'front';
+    const applyMode = () => {
+      if (viewMode === 'front') {
+        // 3Dビューと同じ見え方：マーカーを正面から見たとき、少し上・少し右から眺める角度で立つ
+        orient.rotation.set(-Math.PI / 2 + 0.30, 0, 0);   // モデルの上 → マーカーの上方向（やや手前に傾ける）
+        orient.position.set(0, 0, 0.25);                  // マーカー面より手前に出す
+        m.root.position.set(0.06, 0, -0.17);              // モデルの中心をマーカーの中心に
+        holder.rotation.z = -0.2;                         // 少し右から見る角度
+      } else {
+        // 真上：マーカーを机に置き、その上に刀掛けが建つ
+        orient.rotation.set(0, 0, 0); orient.position.set(0, 0, 0);
+        m.root.position.set(0.06, 0, 0);
+        holder.rotation.z = 0;
+      }
+    };
+    applyMode();
+    const modeBtn = $('btnMode'); modeBtn.style.display = 'inline-block';
+    modeBtn.onclick = () => { viewMode = viewMode === 'front' ? 'top' : 'front'; modeBtn.textContent = viewMode === 'front' ? '表示：正面' : '表示：真上'; applyMode(); };
     anchor.onTargetFound = () => setStatus('');
     anchor.onTargetLost = () => setStatus('鍔の画像にカメラを向けてください');
     await mindar.start();
