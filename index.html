@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>刀掛け AR — 菊花鍔マーカー</title>
+<style>
+  html,body{margin:0;height:100%;background:#0e0e0f;color:#eee;font-family:"Hiragino Sans","Yu Gothic","Noto Sans JP",sans-serif;overflow:hidden;-webkit-tap-highlight-color:transparent}
+  #stage{position:fixed;inset:0}
+  #start{position:fixed;inset:0;z-index:30;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom));background:radial-gradient(ellipse at 50% 30%,#2a2a2d,#0e0e0f 70%);text-align:center}
+  #start h1{margin:0;font-size:22px;letter-spacing:.12em;font-weight:600}
+  #start p{margin:0;font-size:13px;line-height:1.8;color:#bbb;max-width:340px}
+  #start img{width:132px;height:132px;background:#fff;border-radius:12px;padding:8px}
+  .btns{display:flex;flex-direction:column;gap:10px;width:min(320px,90vw)}
+  button,.linkbtn{appearance:none;border:1px solid #6b5a33;background:#1b1a17;color:#f1e6c8;font-size:15px;padding:13px 16px;border-radius:10px;font-family:inherit;letter-spacing:.06em;cursor:pointer;text-decoration:none;text-align:center}
+  button.primary{background:linear-gradient(#b8924a,#8c6a2c);color:#140f05;border-color:#d8b46a;font-weight:700}
+  button:disabled{opacity:.45}
+  #ui{position:fixed;left:0;right:0;bottom:0;z-index:20;display:none;flex-wrap:wrap;gap:8px;justify-content:center;padding:14px 12px calc(14px + env(safe-area-inset-bottom));background:linear-gradient(transparent,rgba(0,0,0,.75))}
+  #ui button{font-size:14px;padding:11px 14px;min-width:64px}
+  #status{position:fixed;top:calc(12px + env(safe-area-inset-top));left:50%;transform:translateX(-50%);z-index:25;background:rgba(0,0,0,.65);padding:8px 14px;border-radius:20px;font-size:13px;display:none;max-width:90vw;text-align:center}
+  #err{color:#ff9b8a;font-size:12px;white-space:pre-wrap}
+  /* MindAR overlays */
+  .mindar-ui-overlay{z-index:15!important}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="stage"></div>
+<div id="status"></div>
+
+<div id="start">
+  <h1>刀掛け AR</h1>
+  <img src="marker.jpg" alt="マーカー（菊花透かし鍔）">
+  <p>この菊花鍔の画像をマーカーにして、刀掛けに掛かった刀を表示します。<br>「抜刀」で鞘が外れ、刃文と樋の入った刀身が見られます。</p>
+  <div class="btns">
+    <button class="primary" id="btnAR">カメラでARを開始</button>
+    <button id="btn3D">3Dで見る（マーカーなし）</button>
+    <a class="linkbtn" href="marker.jpg" target="_blank" rel="noopener">マーカー画像を開く（印刷・表示用）</a>
+  </div>
+  <div id="err"></div>
+</div>
+
+<div id="ui">
+  <button id="btnDraw" class="primary">抜刀</button>
+  <button id="btnRot">回転</button>
+  <button id="btnSmall">小</button>
+  <button id="btnBig">大</button>
+  <button id="btnMind" style="display:none">マーカーデータ保存</button>
+  <button id="btnBack">戻る</button>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const MARKER_URL = 'marker.jpg';
+const MIND_URL = 'targets.mind';          // あれば優先して使う（事前に保存したマーカーデータ）
+const CACHE_KEY = 'kikka-tsuba-mind-v1';
+const K = 0.10;                            // 反り
+const V3 = (x, y, z) => new THREE.Vector3(x, y, z);
+const lin = (a, b, n) => Array.from({ length: n }, (_, i) => a + (b - a) * i / (n - 1));
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+function setStatus(t) { statusEl.textContent = t || ''; statusEl.style.display = t ? 'block' : 'none'; }
+function showErr(e) { console.error(e); $('err').textContent = String(e && e.message || e); $('start').style.display = 'flex'; }
+
+/* ================= textures (procedural) ================= */
+function canvasTex(w, h, fn, srgb = true, repeat = true) {
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const ctx = cv.getContext('2d'); const img = ctx.createImageData(w, h); fn(img.data, w, h);
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(cv);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  if (repeat) t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 4; return t;
+}
+function rng(seed) { let s = seed >>> 0; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296); }
+function blobNormal(size, count, rmin, rmax, strength, seed) {
+  const h = new Float32Array(size * size), r = rng(seed);
+  for (let b = 0; b < count; b++) {
+    const cx = r() * size, cy = r() * size, rad = rmin + r() * (rmax - rmin), amp = 0.5 + r() * 0.5;
+    const R = Math.ceil(rad * 2);
+    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+      const d2 = (dx * dx + dy * dy) / (rad * rad); if (d2 > 4) continue;
+      const x = ((Math.floor(cx) + dx) % size + size) % size, y = ((Math.floor(cy) + dy) % size + size) % size;
+      h[y * size + x] += amp * Math.exp(-d2 * 1.5);
+    }
+  }
+  return canvasTex(size, size, (d) => {
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      const g = (xx, yy) => h[((yy + size) % size) * size + ((xx + size) % size)];
+      let nx = -(g(x + 1, y) - g(x - 1, y)) * strength, ny = -(g(x, y + 1) - g(x, y - 1)) * strength, nz = 1;
+      const l = Math.hypot(nx, ny, nz); nx /= l; ny /= l; nz /= l;
+      const i = (y * size + x) * 4; d[i] = (nx * .5 + .5) * 255; d[i + 1] = (ny * .5 + .5) * 255; d[i + 2] = (nz * .5 + .5) * 255; d[i + 3] = 255;
+    }
+  }, false);
+}
+const smooth = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+const toS = c => Math.pow(c, 1 / 2.2) * 255;
+
+const XB = -0.2885, XT = 0.440, MUNE_Z = -0.0155;
+function hamonLine(xw) {
+  const n = 0.5 + 0.5 * (0.5 * Math.sin(xw * 7.3 + 1.1) + 0.3 * Math.sin(xw * 17.9 + 2.3) + 0.2 * Math.sin(xw * 41.7 + 0.7));
+  return 0.69 + 0.10 * n + 0.025 * Math.sin(xw * 31) + 0.012 * Math.sin(xw * 97 + 0.4);
+}
+function bladeMaps() {
+  const W = 2048, H = 256, r = rng(7);
+  const cols = new Uint8ClampedArray(W * H * 4), rough = new Uint8ClampedArray(W * H * 4);
+  for (let px = 0; px < W; px++) {
+    const xw = XB + (px + .5) / W * (XT - XB), h = hamonLine(xw);
+    for (let py = 0; py < H; py++) {
+      const v = 1 - (py + .5) / H, d = v - h;
+      const F = smooth(-0.012, 0.012, d), glow = Math.max(1 - Math.abs(d) / 0.02, 0);
+      const grain = 1 + (r() - .5) * 0.04;
+      let c = [0.50 + 0.36 * F, 0.52 + 0.35 * F, 0.56 + 0.33 * F];
+      c = c.map(k => (k + (0.97 - k) * glow * 0.6) * grain);
+      const i = (py * W + px) * 4;
+      cols[i] = toS(c[0]); cols[i + 1] = toS(c[1]); cols[i + 2] = toS(c[2]); cols[i + 3] = 255;
+      const rg = 0.07 + 0.22 * F + 0.08 * glow;
+      rough[i] = rough[i + 1] = rough[i + 2] = rg * 255; rough[i + 3] = 255;
+    }
+  }
+  const map = canvasTex(W, H, d => d.set(cols), true, false);
+  const rmap = canvasTex(W, H, d => d.set(rough), false, false);
+  return { map, rmap };
+}
+function stripeBump() {
+  return canvasTex(64, 64, (d, w, h) => {
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const v = 0.5 + 0.5 * Math.sin(2 * Math.PI * (x / w + y / h)); const i = (y * w + x) * 4;
+      d[i] = d[i + 1] = d[i + 2] = v * 255; d[i + 3] = 255;
+    }
+  }, false);
+}
+function checker() {
+  return canvasTex(64, 64, (d, w, h) => {
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const on = ((x >> 3) + (y >> 3)) & 1, i = (y * w + x) * 4, c = on ? 222 : 20;
+      d[i] = d[i + 1] = d[i + 2] = c; d[i + 3] = 255;
+    }
+  });
+}
+
+/* ================= materials ================= */
+function makeMaterials() {
+  const DS = THREE.DoubleSide;
+  const ishime = blobNormal(256, 520, 3, 9, 1.4, 11);
+  const sameN = blobNormal(128, 900, 1.2, 2.6, 2.2, 5);
+  const relief = blobNormal(128, 300, 2, 6, 2.0, 9);
+  const blade = bladeMaps();
+  return {
+    lacquer: new THREE.MeshPhysicalMaterial({ color: 0x060606, roughness: 0.42, clearcoat: 1, clearcoatRoughness: 0.14, normalMap: ishime, normalScale: new THREE.Vector2(0.9, 0.9), side: DS }),
+    stand: new THREE.MeshPhysicalMaterial({ color: 0x0b0b0d, roughness: 0.25, clearcoat: 1, clearcoatRoughness: 0.06, side: DS }),
+    ito: new THREE.MeshPhysicalMaterial({ color: 0xf1efe9, roughness: 0.55, sheen: 1, sheenColor: 0xffffff, sheenRoughness: 0.5, bumpMap: stripeBump(), bumpScale: 0.6, side: DS }),
+    same: new THREE.MeshStandardMaterial({ color: 0xeee1bf, roughness: 0.5, normalMap: sameN, normalScale: new THREE.Vector2(0.7, 0.7), side: DS }),
+    iron: new THREE.MeshStandardMaterial({ color: 0x2a2a2d, metalness: 1, roughness: 0.38, side: DS }),
+    gun: new THREE.MeshStandardMaterial({ color: 0x9a9a9e, metalness: 1, roughness: 0.34, normalMap: relief, normalScale: new THREE.Vector2(1.2, 1.2), side: DS }),
+    gold: new THREE.MeshStandardMaterial({ color: 0xe9bf6d, metalness: 1, roughness: 0.24, side: DS }),
+    horn: new THREE.MeshPhysicalMaterial({ color: 0x050505, roughness: 0.2, clearcoat: 1, side: DS }),
+    menuki: new THREE.MeshStandardMaterial({ color: 0xb4b0a8, metalness: 1, roughness: 0.34, side: DS }),
+    sageo: new THREE.MeshStandardMaterial({ map: checker(), roughness: 0.65, side: DS }),
+    blade: new THREE.MeshPhysicalMaterial({ map: blade.map, roughnessMap: blade.rmap, metalness: 1, roughness: 1, envMapIntensity: 1.35, side: DS }),
+  };
+}
+
+/* ================= geometry helpers ================= */
+function finish(pos, idx, uv) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  if (uv) g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  if (idx) g.setIndex(idx);
+  g.computeVertexNormals(); return g;
+}
+const bend = pos => { for (let i = 0; i < pos.length; i += 3) pos[i + 2] -= K * pos[i] * pos[i]; };
+function mesh(g, m) { const o = new THREE.Mesh(g, m); o.castShadow = o.receiveShadow = true; return o; }
+
+// loft around the X axis; ring is a superellipse (e) with radii ryf/rzf and centre czf
+function loft(xs, ryf, rzf, mat, o = {}) {
+  const n = o.n || 40, e = o.e || 2, czf = o.czf || (() => 0), vS = o.vScale || 0.02, uR = o.uRep || 4;
+  const pos = [], uv = [], idx = [], W = n + 1;
+  xs.forEach(x => {
+    const ry = ryf(x), rz = rzf(x), cz = czf(x);
+    for (let i = 0; i <= n; i++) {
+      const a = 2 * Math.PI * i / n, c = Math.cos(a), s = Math.sin(a);
+      pos.push(x, ry * Math.sign(c) * Math.abs(c) ** (2 / e), cz + rz * Math.sign(s) * Math.abs(s) ** (2 / e));
+      uv.push(i / n * uR, (x - xs[0]) / vS);
+    }
+  });
+  for (let r = 0; r < xs.length - 1; r++) for (let i = 0; i < n; i++) {
+    const a = r * W + i, b = a + 1, c = a + W + 1, d = a + W; idx.push(a, b, d, b, c, d);
+  }
+  if (o.bend !== false) bend(pos);
+  const g = finish(pos, idx, uv);
+  const N = g.attributes.normal; // weld seam normals
+  for (let r = 0; r < xs.length; r++) {
+    const a = r * W, b = r * W + n, v = V3(N.getX(a) + N.getX(b), N.getY(a) + N.getY(b), N.getZ(a) + N.getZ(b)).normalize();
+    N.setXYZ(a, v.x, v.y, v.z); N.setXYZ(b, v.x, v.y, v.z);
+  }
+  const grp = new THREE.Group(); grp.add(mesh(g, mat));
+  // flat caps
+  for (const [r, dir] of [[0, -1], [xs.length - 1, 1]]) {
+    const cp = [], x = pos[r * W * 3], cz0 = czf(xs[r]);
+    const cx = xs[r], ccz = cz0 - (o.bend !== false ? K * cx * cx : 0);
+    for (let i = 0; i < n; i++) {
+      const p = (r * W + i) * 3, q = (r * W + i + 1) * 3;
+      const tri = dir < 0 ? [[x, 0, ccz], [pos[q], pos[q + 1], pos[q + 2]], [pos[p], pos[p + 1], pos[p + 2]]]
+                          : [[x, 0, ccz], [pos[p], pos[p + 1], pos[p + 2]], [pos[q], pos[q + 1], pos[q + 2]]];
+      tri.forEach(t => cp.push(...t));
+    }
+    grp.add(mesh(finish(cp), mat));
+  }
+  return grp;
+}
+
+// solid ribbon: samples of {c, w (half-width vector), n (outward normal)}
+function ribbon(samples, thick, mat, vScale = 0.0016, crown = 0.0005) {
+  const pos = [], uv = [], idx = []; let v = 0, last = null;
+  samples.forEach(({ c, w, n }) => {
+    if (last) v += c.distanceTo(last) / vScale; last = c;
+    const up = n.clone().multiplyScalar(thick / 2), dn = n.clone().multiplyScalar(-thick / 2);
+    const L = c.clone().sub(w).addScaledVector(n, -crown), M = c.clone().addScaledVector(n, crown * 0.3), R = c.clone().add(w).addScaledVector(n, -crown);
+    [L.clone().add(up), M.clone().add(up), R.clone().add(up), L.clone().add(dn), M.clone().add(dn), R.clone().add(dn)].forEach(p => pos.push(p.x, p.y, p.z));
+    uv.push(0, v, .5, v, 1, v, 0, v, .5, v, 1, v);
+  });
+  const S = samples.length;
+  for (let k = 0; k < S - 1; k++) {
+    const a = k * 6, b = a + 6;
+    const quad = (p, q) => idx.push(a + p, a + q, b + q, a + p, b + q, b + p);
+    quad(0, 1); quad(1, 2); quad(4, 3); quad(5, 4); quad(3, 0); quad(2, 5);
+  }
+  bend(pos);
+  return mesh(finish(pos, idx, uv), mat);
+}
+
+/* ================= model ================= */
+function buildModel(M) {
+  const root = new THREE.Group(); root.name = 'KatanaKake';
+  const katana = new THREE.Group(); katana.name = 'Katana';
+  const saya = new THREE.Group(); saya.name = 'Saya';
+  root.add(katana, saya);
+
+  // ---------- saya ----------
+  const X0 = -0.2885, X1 = 0.445;
+  const sayaF = x => { if (x > X1 - 0.014) { const u = Math.min((x - (X1 - 0.014)) / 0.014, 1); return Math.sqrt(Math.max(1 - u * u, 0.02)); } return 1; };
+  const sRz = x => (0.0165 - 0.003 * (Math.min(x, X1) - X0) / (X1 - X0)) * sayaF(x);
+  const sRy = x => (0.0115 - 0.002 * (Math.min(x, X1) - X0) / (X1 - X0)) * sayaF(x);
+  const sxs = [X0, ...lin(X0 + 0.004, X1 - 0.014, 70), ...Array.from({ length: 10 }, (_, k) => X1 - 0.014 + 0.014 * (1 - Math.cos(Math.PI / 2 * (k + 1) / 10)))];
+  saya.add(loft(sxs, sRy, sRz, M.lacquer, { n: 48 }));
+  const kx = [X1 - 0.024, X1 - 0.0235, ...Array.from({ length: 13 }, (_, k) => X1 - 0.014 + 0.0146 * (1 - Math.cos(Math.PI / 2 * k / 12)))];
+  saya.add(loft(kx, x => sRy(x) * 1.04 + 0.0002, x => sRz(x) * 1.04 + 0.0002, M.iron, { n: 48 }));
+  const kf = x => (x > X0 + 0.0004 && x < X0 + 0.0086) ? 1.03 : 1.0;
+  saya.add(loft([X0, X0 + 0.0005, X0 + 0.0085, X0 + 0.009], x => sRy(x) * kf(x), x => sRz(x) * kf(x), M.horn, { n: 48 }));
+  // sageo
+  const sN = (x, th) => V3(0, Math.cos(th) / sRy(x), Math.sin(th) / sRz(x)).normalize();
+  const sP = (x, th, off) => V3(x, (sRy(x) + off) * Math.cos(th), (sRz(x) + off) * Math.sin(th));
+  for (const x0 of [-0.270, -0.258, -0.246]) {
+    const s = []; for (let k = 0; k <= 96; k++) { const th = 2 * Math.PI * k / 96, x = x0 + 0.004 * Math.cos(th - Math.PI); s.push({ c: sP(x, th, 0.0016), w: V3(0.0038, 0, 0), n: sN(x, th) }); }
+    saya.add(ribbon(s, 0.0018, M.sageo, 0.0096, 0.0003));
+  }
+  for (const sg of [1, -1]) {
+    const s = []; for (let k = 0; k <= 40; k++) { const t = k / 40, x = -0.274 + 0.034 * t, th = Math.PI + sg * (-1 + 2 * t); s.push({ c: sP(x, th, 0.0034), w: V3(0.0038, 0, 0), n: sN(x, th) }); }
+    saya.add(ribbon(s, 0.0018, M.sageo, 0.0096, 0.0003));
+  }
+  [[Math.PI - 0.20, Math.PI - 0.45, -0.150, 0], [Math.PI + 0.18, Math.PI + 0.40, -0.165, 1]].forEach(([a0, a1, xe, i]) => {
+    const s = []; for (let k = 0; k <= 40; k++) {
+      const t = k / 40, x = -0.240 + (xe + 0.240) * t, th = a0 + (a1 - a0) * t;
+      const tg = V3(0, -sRy(x) * Math.sin(th), sRz(x) * Math.cos(th)).normalize().multiplyScalar(0.0042);
+      s.push({ c: sP(x, th, 0.0030 + 0.0008 * i), w: tg, n: sN(x, th) });
+    }
+    saya.add(ribbon(s, 0.0018, M.sageo, 0.0096, 0.0003));
+  });
+
+  // ---------- tsuka ----------
+  const TA = -0.552, TB = -0.3045;
+  const tRz = x => { const t = (x - TA) / (TB - TA); return 0.0140 + 0.0012 * t - 0.0006 * Math.sin(Math.PI * t); };
+  const tRy = x => 0.0106 + 0.0006 * (x - TA) / (TB - TA);
+  katana.add(loft(lin(TA, TB, 40), tRy, tRz, M.same, { uRep: 6, vScale: 0.006 }));
+  const p = 0.0255, w = 0.0186, xa = TA + w / 2 + 0.001, xb = TB - w / 2 - 0.001;
+  for (const [sg, off] of [[1, 0.0013], [-1, 0.0025]]) {
+    const s = [];
+    for (const x of lin(xa, xb, 520)) {
+      const th = Math.PI / 2 + sg * Math.PI * (x - xa) / p, ry = tRy(x) + off, rz = tRz(x) + off;
+      s.push({ c: V3(x, ry * Math.cos(th), rz * Math.sin(th)), w: V3(w / 2, 0, 0), n: V3(0, Math.cos(th) / ry, Math.sin(th) / rz).normalize() });
+    }
+    katana.add(ribbon(s, 0.0010, M.ito));
+  }
+  const KA = -0.5625, kfn = x => x < KA + 0.006 ? Math.sqrt(Math.max(1 - (1 - (x - KA) / 0.006) ** 2, 0.05)) : 1;
+  katana.add(loft([...Array.from({ length: 11 }, (_, k) => KA + 0.006 * (1 - Math.cos(Math.PI / 2 * k / 10))), TA + 0.0015], x => 0.0118 * kfn(x), x => 0.0150 * kfn(x), M.gun, { uRep: 3, vScale: 0.006 }));
+  // ito crossing over the kashira
+  [0.42, -0.42].forEach((tilt, i) => {
+    const xc = KA + 0.006, off = 0.0014 + 0.0011 * i, s = [], e = new THREE.Euler(tilt, 0, 0);
+    const pts = [...lin(xc + 0.010, xc, 6).map(x => [x, Math.PI / 2]), ...lin(Math.PI / 2, -Math.PI / 2, 30).map(a => [null, a]), ...lin(xc, xc + 0.010, 6).map(x => [x, -Math.PI / 2])];
+    for (const [x, a] of pts) {
+      let c, n;
+      if (x === null) { c = V3(xc - (0.006 + off) * Math.cos(a), 0, (0.0150 + off) * Math.sin(a)); n = V3(-Math.cos(a) / 0.006, 0, Math.sin(a) / 0.015).normalize(); }
+      else { c = V3(x, 0, (0.0150 + off) * Math.sin(a)); n = V3(0, 0, Math.sin(a)); }
+      s.push({ c: c.applyEuler(e), w: V3(0, 0.0042, 0).applyEuler(e), n: n.applyEuler(e) });
+    }
+    katana.add(ribbon(s, 0.0010, M.ito));
+  });
+  const end97 = (a, b) => x => (x === a || x === b) ? 0.97 : 1;
+  const ff = end97(TB - 0.001, -0.2965);
+  katana.add(loft([TB - 0.001, TB - 0.0004, -0.2972, -0.2965], x => 0.0123 * ff(x), x => 0.0158 * ff(x), M.gun, { uRep: 3, vScale: 0.006 }));
+  katana.add(loft([-0.2965, -0.2950], () => 0.0175, () => 0.0225, M.gold));
+  katana.add(loft([-0.2900, -0.2885], () => 0.0175, () => 0.0225, M.gold));
+  // menuki (organic ornaments under the wrap)
+  for (const [xc, side] of [[-0.425, -1], [-0.405, 1]]) {
+    const L = 0.048, sph = new THREE.SphereGeometry(1, 14, 10);
+    for (let k = 0; k < 16; k++) {
+      const t = k / 15, x = xc - L / 2 + L * t;
+      const z = 0.0055 * Math.sin(2 * Math.PI * t * 1.3) * (0.4 + 0.6 * Math.sin(Math.PI * t));
+      const th = Math.asin(Math.max(-0.95, Math.min(0.95, z / tRz(x)))), y = side * tRy(x) * Math.cos(th);
+      const add = (px, pz, r) => { const m = mesh(sph, M.menuki); m.position.set(px, y + side * 0.0004, pz - K * px * px); m.scale.set(r, r * 0.6, r); katana.add(m); };
+      add(x, z, 0.0032 * (0.6 + 0.5 * Math.sin(Math.PI * t)) * 0.62);
+      if (k % 3 === 1) add(x + 0.002, z + (k % 2 ? 0.0045 : -0.0045), 0.0011);
+    }
+  }
+
+  // ---------- kikka-sukashi tsuba ----------
+  katana.add(buildTsuba(M.iron));
+
+  // ---------- blade (shinogi-zukuri with bo-hi) ----------
+  const Wf = x => { let w = 0.031 + (0.0232 - 0.031) * (x - XB) / (XT - XB); const xs = XT - 0.048; if (x > xs) { const u = Math.min((x - xs) / 0.048, 1); w *= Math.sqrt(Math.max(1 - u ** 3, 0)); } return Math.max(w, 0.0008); };
+  const Tf = x => { let t = 0.0074 + (0.0058 - 0.0074) * (x - XB) / (XT - XB); const xs = XT - 0.048; if (x > xs) { const u = Math.min((x - xs) / 0.048, 1); t *= Math.max(Math.sqrt(Math.max(1 - u * u, 0)), 0.15); } return t; };
+  const HI_END = 0.330, gf = x => x < HI_END - 0.016 ? 1 : x > HI_END ? 0 : Math.cos((x - (HI_END - 0.016)) / 0.016 * Math.PI / 2);
+  const half = x => { const h = Tf(x) / 2, g = gf(x); return [[0, 0], [h * .8, .035], [h * .98, .07], [h * .99, .12], [h * (1 - .4 * g), .15], [h * (1 - .45 * g), .21], [h * (1 - .4 * g), .27], [h * .995, .30], [h, .35], [h * .74, .6], [h * .36, .85], [h * .09, .97], [0, 1]]; };
+  const section = x => { const hp = half(x); return [...hp, ...hp.slice(1, -1).reverse().map(([y, v]) => [-y, v])]; };
+  const bxs = []; for (let x = XB; x < XT - 0.05; x += 0.003) bxs.push(x);
+  for (let k = 0; k <= 30; k++) bxs.push(XT - 0.05 + 0.05 * (1 - Math.cos(Math.PI / 2 * k / 30)));
+  {
+    const pos = [], uv = [], idx = []; let n = 0;
+    bxs.forEach(x => { const W = Wf(x), sec = section(x); n = sec.length; sec.forEach(([y, v]) => { pos.push(x, y, MUNE_Z + v * W); uv.push((x - XB) / (XT - XB), v); }); });
+    for (let r = 0; r < bxs.length - 1; r++) for (let i = 0; i < n; i++) { const j = (i + 1) % n, a = r * n + i, b = r * n + j, c = (r + 1) * n + j, d = (r + 1) * n + i; idx.push(a, b, d, b, c, d); }
+    bend(pos);
+    const bl = mesh(finish(pos, idx, uv), M.blade); bl.name = 'Blade'; katana.add(bl);
+  }
+  // habaki
+  {
+    const hx = [-0.2885, -0.2880, -0.2620, -0.2610];
+    const sc = x => (x === hx[0] || x === hx[3]) ? 0.97 : 1, tp = x => 1 - 0.18 * (x - hx[0]) / (hx[3] - hx[0]);
+    katana.add(loft(hx, x => 0.0062 * tp(x) * sc(x), x => (Wf(x) / 2 + 0.0018) * sc(x), M.gold, { e: 3.5, czf: x => MUNE_Z + Wf(x) / 2 }));
+  }
+
+  // ---------- katana-kake (stand) ----------
+  root.add(buildStand(M.stand));
+  return { root, katana, saya };
+}
+
+function buildTsuba(mat) {
+  const NA = 16 * 20, NR = 40, UIN = 0.22, SY = 0.0385, SZ = 0.0405, SP = 0.075, RA = 0.43, RB = 0.83, XC = -0.2925, HT = 0.0024;
+  const rout = ph => 0.935 + 0.065 * Math.sqrt(Math.abs(Math.cos(8 * ph)));
+  const cap = (px, py) => {
+    const ph = Math.atan2(py, px), k = Math.round(ph / (2 * Math.PI / 16)), ac = k * 2 * Math.PI / 16;
+    const ax = Math.cos(ac), ay = Math.sin(ac), t = Math.max(RA, Math.min(RB, px * ax + py * ay));
+    const cx = ax * t, cy = ay * t, rad = t * Math.sin(Math.PI / 16) - SP / 2;
+    return { cx, cy, rad, d: Math.hypot(px - cx, py - cy) };
+  };
+  const P = [], J = [];
+  for (let j = 0; j <= NR; j++) { const u = UIN + (1 - UIN) * j / NR; for (let i = 0; i < NA; i++) { const ph = 2 * Math.PI * i / NA, r = u * rout(ph); P.push([r * Math.cos(ph), r * Math.sin(ph)]); J.push(j); } }
+  const vid = (j, i) => j * NA + ((i % NA) + NA) % NA;
+  const faces = [];
+  for (let j = 0; j < NR; j++) for (let i = 0; i < NA; i++) {
+    const q = [vid(j, i), vid(j, i + 1), vid(j + 1, i + 1), vid(j + 1, i)];
+    const cy = q.reduce((s, v) => s + P[v][0], 0) / 4, cz = q.reduce((s, v) => s + P[v][1], 0) / 4;
+    const c = cap(cy, cz); if (!(c.d < c.rad)) faces.push(q);
+  }
+  const ec = new Map(); const key = (a, b) => a < b ? a + '_' + b : b + '_' + a;
+  for (const q of faces) for (let k = 0; k < 4; k++) { const a = q[k], b = q[(k + 1) % 4], kk = key(a, b); const e = ec.get(kk); if (e) e.n++; else ec.set(kk, { a, b, n: 1 }); }
+  const bnd = [...ec.values()].filter(e => e.n === 1);
+  const moved = new Set();
+  for (const e of bnd) for (const v of [e.a, e.b]) {
+    if (moved.has(v) || J[v] === 0 || J[v] === NR) continue; moved.add(v);
+    const c = cap(P[v][0], P[v][1]); if (c.d > 1e-9) P[v] = [c.cx + (P[v][0] - c.cx) / c.d * c.rad, c.cy + (P[v][1] - c.cy) / c.d * c.rad];
+  }
+  // orientation of each boundary edge (as it appears in its single face)
+  const dirEdges = []; const bset = new Set(bnd.map(e => key(e.a, e.b)));
+  for (const q of faces) for (let k = 0; k < 4; k++) { const a = q[k], b = q[(k + 1) % 4]; if (bset.has(key(a, b))) dirEdges.push([a, b]); }
+  const w3 = (v, x) => { const y = P[v][0] * SY, z = P[v][1] * SZ; return [x, y, z - K * x * x]; };
+  const grp = new THREE.Group();
+  for (const [x, flip] of [[XC - HT, true], [XC + HT, false]]) {
+    const pos = []; P.forEach((_, v) => pos.push(...w3(v, x)));
+    const idx = []; faces.forEach(([a, b, c, d]) => flip ? idx.push(a, d, b, b, d, c) : idx.push(a, b, d, b, c, d));
+    grp.add(mesh(finish(pos, idx), mat));
+  }
+  const wp = [];
+  for (const [a, b] of dirEdges) { const A0 = w3(a, XC - HT), B0 = w3(b, XC - HT), A1 = w3(a, XC + HT), B1 = w3(b, XC + HT); wp.push(...A0, ...A1, ...B1, ...A0, ...B1, ...B0); }
+  grp.add(mesh(finish(wp), mat));
+  grp.name = 'Tsuba'; return grp;
+}
+
+function buildStand(mat) {
+  const grp = new THREE.Group(); grp.name = 'Stand';
+  const bt = 0.0014;
+  const extrudeX = (pts, xc, halfW, z0) => {        // pts: [d, z]; extruded along X
+    const sh = new THREE.Shape(pts.map(([d, z]) => new THREE.Vector2(-d, z)));
+    const g = new THREE.ExtrudeGeometry(sh, { depth: 2 * halfW - 2 * bt, bevelEnabled: true, bevelThickness: bt, bevelSize: bt, bevelOffset: -bt, bevelSegments: 2, curveSegments: 6 });
+    g.applyMatrix4(new THREE.Matrix4().set(0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1));
+    g.translate(xc - halfW + bt, 0, z0);
+    return mesh(g, mat);
+  };
+  const arc = (cd, cz, r, a0, a1, n) => Array.from({ length: n - 1 }, (_, k) => { const a = a0 + (a1 - a0) * (k + 1) / n; return [cd + r * Math.cos(a), cz + r * Math.sin(a)]; });
+  const R = 0.0135;
+  const outline = [[-0.035, 0], [0.045, 0], [0.045, 0.10], [0.050, 0.15], [0.046, 0.188], [0.042, 0.196], [0.030, 0.196], [0.0255, 0.19], [0.0255, 0.165],
+    ...arc(0.012, 0.165, R, 0, -Math.PI, 14), [-0.0015, 0.165], [-0.0015, 0.20], [0.008, 0.24], [0.022, 0.275], [0.028, 0.308], [0.025, 0.320], [0.016, 0.321], [0.0135, 0.315], [0.0135, 0.29],
+    ...arc(0, 0.29, R, 0, -Math.PI, 14), [-0.0135, 0.29], [-0.0135, 0.33], [-0.018, 0.337], [-0.032, 0.337], [-0.038, 0.33], [-0.041, 0.29], [-0.036, 0.22], [-0.030, 0.13], [-0.035, 0.05]];
+  for (const xc of [-0.23, 0.23]) {
+    grp.add(extrudeX(outline, xc, 0.012, 0.03));
+    grp.add(extrudeX([[-0.075, 0], [0.085, 0], [0.085, 0.018], [0.075, 0.03], [-0.065, 0.03], [-0.075, 0.018]], xc, 0.022, 0));
+  }
+  grp.add(extrudeX([[0.030, 0.006], [0.048, 0.006], [0.048, 0.020], [0.030, 0.020]], 0, 0.226, 0));
+  // back panel with shaped lower edge, extruded along Y
+  const Wp = 0.222, zb = x => 0.045 + 0.028 * Math.max(Math.cos(Math.PI * x / (2 * Wp)), 0) ** 1.5 - 0.008 * Math.exp(-((x / 0.025) ** 2));
+  const pts = [...lin(-Wp, Wp, 30).map(x => [x, 0.135 + 0.004 * (1 - (x / Wp) ** 2)]), ...lin(Wp, -Wp, 60).map(x => [x, zb(x)])];
+  const depth = 0.014 - 2 * bt;
+  const g = new THREE.ExtrudeGeometry(new THREE.Shape(pts.map(([x, z]) => new THREE.Vector2(x, z))), { depth, bevelEnabled: true, bevelThickness: bt, bevelSize: bt, bevelOffset: -bt, bevelSegments: 2, curveSegments: 6 });
+  g.applyMatrix4(new THREE.Matrix4().set(1, 0, 0, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, 0, 0, 1));
+  g.translate(0, 0.016 + depth + bt, 0);
+  grp.add(mesh(g, mat));
+  return grp;
+}
+
+/* ================= state & animation ================= */
+const SHEATHED = V3(0, 0, 0.32755), DRAWN = V3(0, -0.012, 0.20255), OUT = 0.78;
+let model = null, drawn = false, anim = null;
+function startDraw(toDrawn) {
+  const a = SHEATHED, d = DRAWN;
+  const path = [a.clone(), a.clone().add(V3(OUT, 0, 0)), d.clone().add(V3(OUT, 0, 0)), d.clone()];
+  anim = { pts: toDrawn ? path : path.reverse(), seg: 0, t: 0, dur: toDrawn ? [1.0, 0.7, 1.0] : [1.0, 0.7, 1.0] };
+  drawn = toDrawn; $('btnDraw').textContent = drawn ? '納刀' : '抜刀';
+}
+const ease = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+function tick(dt) {
+  if (!anim || !model) return;
+  anim.t += dt / anim.dur[anim.seg];
+  if (anim.t >= 1) { anim.t = 0; anim.seg++; if (anim.seg >= 3) { model.saya.position.copy(anim.pts[3]); anim = null; return; } }
+  const s = anim.seg; model.saya.position.lerpVectors(anim.pts[s], anim.pts[s + 1], ease(anim.t));
+}
+
+function makeRig(scene, renderer, container) {
+  renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.0;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  const pm = new THREE.PMREMGenerator(renderer);
+  scene.environment = pm.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+  const M = makeMaterials();
+  model = buildModel(M);
+  model.saya.position.copy(SHEATHED); model.katana.position.copy(SHEATHED);
+  // light rig lives with the model (Z-up, metres)
+  const key = new THREE.DirectionalLight(0xffffff, 2.2); key.position.set(-0.6, -0.7, 1.2);
+  key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -0.0004; key.shadow.normalBias = 0.002;
+  Object.assign(key.shadow.camera, { left: -0.8, right: 0.8, top: 0.6, bottom: -0.6, near: 0.1, far: 3 });
+  key.target.position.set(0, 0, 0.15);
+  model.root.add(key, key.target);
+  model.root.add(new THREE.HemisphereLight(0xffffff, 0x404040, 0.35));
+  const shadowPlane = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 0.8), new THREE.ShadowMaterial({ opacity: 0.38 }));
+  shadowPlane.receiveShadow = true; shadowPlane.position.set(-0.04, 0, 0.0005); model.root.add(shadowPlane);
+  model.root.traverse(o => { if (o.isMesh && o !== shadowPlane) { o.castShadow = true; o.receiveShadow = true; } });
+  return model;
+}
+
+/* ================= 3D viewer mode ================= */
+async function start3D() {
+  $('start').style.display = 'none'; $('ui').style.display = 'flex'; $('btnSmall').style.display = $('btnBig').style.display = 'none';
+  const container = $('stage');
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setSize(innerWidth, innerHeight);
+  container.appendChild(renderer.domElement);
+  const scene = new THREE.Scene(); scene.background = new THREE.Color(0x2b2c2f);
+  const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.01, 20);
+  camera.up.set(0, 0, 1); camera.position.set(0.28, -1.35, 0.62);
+  const m = makeRig(scene, renderer, container);
+  const holder = new THREE.Group(); holder.position.x = 0.06; holder.add(m.root); scene.add(holder);
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(2.5, 64), new THREE.MeshStandardMaterial({ color: 0x3a3b3e, roughness: 0.9 }));
+  floor.receiveShadow = true; floor.position.z = -0.0005; scene.add(floor);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 0, 0.2); controls.enableDamping = true; controls.minDistance = 0.12; controls.maxDistance = 3;
+  controls.maxPolarAngle = Math.PI * 0.49; controls.update();
+  addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+  bindUI(holder);
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => { tick(Math.min(clock.getDelta(), 0.05)); controls.update(); renderer.render(scene, camera); });
+  window.__app = { mode: '3d', scene, camera, model: m, startDraw };
+}
+
+/* ================= AR mode (MindAR image tracking) ================= */
+let lastMind = null;
+const b64 = { enc: u8 => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); },
+              dec: s => Uint8Array.from(atob(s), c => c.charCodeAt(0)) };
+async function getTargetSrc() {
+  try { const r = await fetch(MIND_URL, { cache: 'no-store' }); if (r.ok) { const b = await r.blob(); if (b.size > 1000) return URL.createObjectURL(b); } } catch (e) {}
+  let cached = null; try { cached = localStorage.getItem(CACHE_KEY); } catch (e) {}
+  if (cached) { lastMind = b64.dec(cached); return URL.createObjectURL(new Blob([lastMind])); }
+  setStatus('マーカー画像を解析中… 0%（初回のみ）');
+  let Compiler = window.MINDAR && window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler;
+  if (!Compiler) { const mod = await import('https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image.prod.js'); Compiler = mod.Compiler || (window.MINDAR && window.MINDAR.IMAGE && window.MINDAR.IMAGE.Compiler); }
+  if (!Compiler) throw new Error('マーカー解析モジュールを読み込めませんでした');
+  const img = new Image(); img.src = MARKER_URL; await img.decode();
+  const compiler = new Compiler();
+  await compiler.compileImageTargets([img], pr => setStatus(`マーカー画像を解析中… ${Math.round(pr)}%（初回のみ）`));
+  lastMind = new Uint8Array(await compiler.exportData());
+  try { localStorage.setItem(CACHE_KEY, b64.enc(lastMind)); } catch (e) {}
+  return URL.createObjectURL(new Blob([lastMind]));
+}
+window.__getTargetSrc = getTargetSrc;
+
+async function startAR() {
+  $('btnAR').disabled = true; setStatus('準備中…');
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('この環境ではカメラが使えません。HTTPSで公開したページをスマホのSafari/Chromeで開いてください。');
+    const { MindARThree } = await import('mindar-image-three');
+    const imageTargetSrc = await getTargetSrc();
+    $('start').style.display = 'none';
+    setStatus('鍔の画像にカメラを向けてください');
+    const mindar = new MindARThree({ container: $('stage'), imageTargetSrc, uiLoading: 'no', uiScanning: 'no', uiError: 'yes', filterMinCF: 0.0001, filterBeta: 0.004, missTolerance: 8 });
+    const { renderer, scene, camera } = mindar;
+    const m = makeRig(scene, renderer, $('stage'));
+    const anchor = mindar.addAnchor(0);
+    const holder = new THREE.Group(); holder.scale.setScalar(1.6); holder.add(m.root); m.root.position.x = 0.06;
+    anchor.group.add(holder);
+    anchor.onTargetFound = () => setStatus('');
+    anchor.onTargetLost = () => setStatus('鍔の画像にカメラを向けてください');
+    await mindar.start();
+    $('ui').style.display = 'flex';
+    if (lastMind) $('btnMind').style.display = 'inline-block';
+    bindUI(holder);
+    const clock = new THREE.Clock();
+    renderer.setAnimationLoop(() => { tick(Math.min(clock.getDelta(), 0.05)); renderer.render(scene, camera); });
+    window.__app = { mode: 'ar', mindar, model: m };
+  } catch (e) { setStatus(''); $('btnAR').disabled = false; showErr(e); }
+}
+
+/* ================= UI ================= */
+let uiBound = false;
+function bindUI(holder) {
+  if (uiBound) return; uiBound = true;
+  $('btnDraw').onclick = () => { if (!anim) startDraw(!drawn); };
+  $('btnRot').onclick = () => { holder.rotation.z += Math.PI / 2; };
+  $('btnSmall').onclick = () => holder.scale.multiplyScalar(1 / 1.25);
+  $('btnBig').onclick = () => holder.scale.multiplyScalar(1.25);
+  $('btnBack').onclick = () => location.reload();
+  $('btnMind').onclick = () => {
+    if (!lastMind) return;
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([lastMind])); a.download = 'targets.mind'; a.click();
+  };
+}
+$('btnAR').onclick = startAR;
+$('btn3D').onclick = () => start3D().catch(showErr);
+</script>
+</body>
+</html>
